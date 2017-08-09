@@ -4,10 +4,20 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
+	"net/http"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 	"time"
 
 	"github.com/maksadbek/distroleader/internal"
+	"github.com/maksadbek/distroleader/internal/kv"
 	"github.com/pkg/errors"
+)
+
+const (
+	maxTimeout = 300
+	minTimeout = 150
 )
 
 var (
@@ -36,13 +46,59 @@ type Agent struct {
 	matchIndex []int64
 
 	logger *log.Logger
+
+	internal.Config
 }
 
 func (a *Agent) Run() error {
 	// start with follower state
 	a.State = internal.StateFollower
 
+	rpc.Register(a)
+	rpc.HandleHTTP()
+
+	// get any random free port
+	ln, err := net.Listen("tcp", "")
+	if err != nil {
+		return err
+	}
+
+	// use JSON as a transport payload format
+	rpc.ServeCodec(jsonrpc.NewServerCodec(ln))
+
+	// start server
+	go http.Serve(ln, nil)
+
+	a.logger.Printf("Started listening on address: %s", ln.Addr())
+
 	rand.Seed(time.Now().Unix())
+
+	after := make(chan time.Time)
+
+	for {
+		select {
+		case <-after:
+			// timeout
+			// convert to candidate state, and start election
+			a.logger.Printf("timeout, starting election, ID: #%s", ln.Addr())
+			a.State = internal.StateCandidate
+
+			err := a.StartElection()
+			if err != nil {
+				// failed election, turn to follower
+				a.State = internal.Follower
+				fallthrough
+			}
+
+			// no error, no problem. Won election, convert to leader state
+			a.State = internal.StateLeader
+			a.logger.Printf("won election! converted to a leader, ID: #%s", ln.Addr())
+		default:
+			// reset timer
+			c = time.After(time.Millisecond * time.Duration(rand.Int31n(maxTimeout)))
+		}
+	}
+
 }
 
 // request vote
@@ -139,4 +195,54 @@ func (a *Agent) AppendEntries(request AppendEntriesRequest, response *AppendEntr
 }
 
 func (a *Agent) StartElection() error {
+	return nil
+}
+
+// JoinCluster joins to the existing cluster
+// receives leader address
+//  	leader address must be a address with port number, e.g: 127.0.0.1:59324
+// returns error as a status of join
+//   	error is nil if joined successfully
+func (a *Agent) JoinCluster(addr string) error {
+	return nil
+}
+
+// SendHeartbeats sends log entry request with empty entry slice to all peers
+// if any of them do not respond, start election
+func SendHeartbeats() error {
+	for peer := range a.peers {
+		timeout := time.After(rand.Int31n(300))
+		err := a.sendHeartBeat(peer)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// sendHeartbeat creates a RPC connection between peer
+// receives peer address
+func (a *Agent) sendHeartbeat(addr string) error {
+	return nil
+}
+
+type AddLogRequest struct {
+	Op    internal.LogOp
+	Key   string
+	Value interface{}
+}
+
+type AddLogResponse struct {
+	Success bool
+}
+
+func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
+	switch a.currentState {
+	case internal.StateFollower:
+		// redirect request to leader
+	case internal.StateLeader:
+	case internal.StateCandidate:
+	default:
+	}
 }
