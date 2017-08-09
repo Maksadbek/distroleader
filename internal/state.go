@@ -3,7 +3,7 @@ package internal
 type State uint8
 
 const (
-	StateFollower = iota
+	StateFollower State = iota
 	StateCandidate
 	StateLeader
 )

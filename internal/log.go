@@ -1,4 +1,4 @@
-package agent
+package internal
 
 type LogOp uint8
 

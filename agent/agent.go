@@ -3,6 +3,8 @@ package agent
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"time"
 
 	"github.com/maksadbek/distroleader/internal"
 	"github.com/pkg/errors"
@@ -17,7 +19,8 @@ type Agent struct {
 	// persistent states
 	currentTerm uint64
 	votedFor    uint64
-	logs        []Log
+	logs        []internal.Log
+	kv          kv.Store
 
 	// volatile states for all servers
 	//
@@ -33,6 +36,13 @@ type Agent struct {
 	matchIndex []int64
 
 	logger *log.Logger
+}
+
+func (a *Agent) Run() error {
+	// start with follower state
+	a.State = internal.StateFollower
+
+	rand.Seed(time.Now().Unix())
 }
 
 // request vote
@@ -126,4 +136,7 @@ func (a *Agent) AppendEntries(request AppendEntriesRequest, response *AppendEntr
 		}
 	}
 	return nil
+}
+
+func (a *Agent) StartElection() error {
 }
