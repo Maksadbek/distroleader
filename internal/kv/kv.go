@@ -1,20 +1,44 @@
 // Package KV implements Key-Value store backed by Badger
 package kv
 
-import "github.com/dgraph-io/badger"
+import (
+	"github.com/dgraph-io/badger"
+)
 
 type Store struct {
 	kv *badger.KV
 }
 
-func Put(key string, value interface{}) error {
-	return nil
+func New(dir, file string) (*Store, error) {
+	opt := badger.DefaultOptions
+
+	opt.Dir = dir
+	opt.ValueDir = file
+
+	kv, err := badger.NewKV(&opt)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Store{
+		kv: kv,
+	}, nil
 }
 
-func Get(key string) (interface{}, error) {
-	return nil, nil
+func (s *Store) Put(key string, value string) error {
+	return s.kv.Set([]byte(key), []byte(value), 0x00)
 }
 
-func Delete(key) error {
-	return nil
+func (s *Store) Get(key string) (string, error) {
+	var item badger.KVItem
+
+	if err := s.kv.Get([]byte(key), &item); err != nil {
+		return "", err
+	}
+
+	return string(item.Value()), nil
+}
+
+func (s *Store) Delete(key string) error {
+	return s.kv.Delete([]byte(key))
 }
