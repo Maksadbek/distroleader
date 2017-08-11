@@ -37,6 +37,7 @@ type Agent struct {
 	commitIndex  uint64
 	lastApplied  uint64
 	currentState internal.State
+	leaderAddr   string
 
 	// peers is a slice of peer addresses
 	peers []string
@@ -52,7 +53,7 @@ type Agent struct {
 
 func (a *Agent) Run() error {
 	// start with follower state
-	a.State = internal.StateFollower
+	a.currentState = internal.StateFollower
 
 	rpc.Register(a)
 	rpc.HandleHTTP()
@@ -81,7 +82,7 @@ func (a *Agent) Run() error {
 			// timeout
 			// convert to candidate state, and start election
 			a.logger.Printf("timeout, starting election, ID: #%s", ln.Addr())
-			a.State = internal.StateCandidate
+			a.currentState = internal.StateCandidate
 
 			err := a.StartElection()
 			if err != nil {
@@ -142,7 +143,7 @@ type AppendEntriesRequest struct {
 	PrevLogIndex uint64
 	PrevLogTerm  uint64
 	LeaderCommit uint64
-	Entries      []Log
+	Entries      []internal.Log
 }
 
 type AppendEntriesResponse struct {
@@ -230,18 +231,121 @@ func (a *Agent) sendHeartbeat(addr string) error {
 type AddLogRequest struct {
 	Op    internal.LogOp
 	Key   string
-	Value interface{}
+	Value string
 }
 
 type AddLogResponse struct {
 	Success bool
+	Value   string
 }
 
 func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
+	reply := AddLogResponse{}
+
+	// if get operation, get and send value back
+	if request.Op == internal.LogOpGet {
+		value, err := a.kv.Get(request.Key)
+		if err != nil {
+			return err
+		}
+
+		reply.Success = true
+		reply.Value = value
+
+		return
+	}
+
 	switch a.currentState {
 	case internal.StateFollower:
 		// redirect request to leader
+		client, err := rpc.DialHTTP("tcp", a.LeaderAddr)
+		if err != nil {
+			return err
+		}
+
+		err = client.Call("Agent.AddLog", request, &reply)
+		if err != nil {
+			return err
+		}
 	case internal.StateLeader:
+		// add log and send AppendEntries request
+		var index uint64
+		if len(a.log) > 0 {
+			index = a.log[len(a.log)-1].Index + 1
+		} else {
+			index = 1
+		}
+
+		a.logs = append(a.logs, internal.Log{
+			Op:    request.Op,
+			Index: index,
+			Key:   request.Key,
+			Value: request.Value,
+			Term:  a.currentTerm,
+		})
+
+		var successCount int32
+		var wg sync.WaitGroup
+
+		wg.Add(len(peers))
+
+		for _, p := range a.peers {
+			go func(peerAddr string) {
+				defer wg.Done()
+
+				client, err := rpc.DialHTTP("tcp", peerAddr)
+				if err != nil {
+					a.logger.Println(err)
+				}
+
+				newLog := AppendEntriesRequest{
+					Term:         a.currentTerm,
+					LeaderID:     a.leaderID,
+					PrevLogIndex: 0,
+					PrevLogTerm:  0,
+					LeaderCommit: a.commitIndex,
+					Entries: []internal.Log{
+						internal.Log{
+							Op:    request.Op,
+							Index: index,
+							Key:   request.Key,
+							Value: request.Value,
+							Term:  a.currentTerm,
+						},
+					},
+				}
+
+				reply := AppendEntriesResponse{}
+				err = client.Call("Agent.AppendEntries", newLog, &reply)
+				if err != nil {
+					a.logger.Println(err)
+				}
+
+				atomic.AddInt32(&successCount, 1)
+			}(p)
+		}
+
+		wg.Wait()
+
+		// if majority of servers accepted entry, then commit and flush into KV store
+		if len(peers)/2+1 <= successCount {
+			switch request.Op {
+			case internal.LogOpPut:
+				err = a.kv.Put(request.Key, request.Value)
+				if err != nil {
+					return err
+				}
+			case internal.LogUpDelete:
+				err = a.kv.Delete(request.Key)
+				if err != nil {
+					return err
+				}
+			default:
+				return errors.New("invalid log operation")
+			}
+		} else {
+
+		}
 	case internal.StateCandidate:
 	default:
 	}
