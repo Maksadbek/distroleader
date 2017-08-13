@@ -7,7 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
-	"net/rpc/jsonrpc"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/maksadbek/distroleader/internal"
@@ -38,6 +39,7 @@ type Agent struct {
 	lastApplied  uint64
 	currentState internal.State
 	leaderAddr   string
+	id           int
 
 	// peers is a slice of peer addresses
 	peers []string
@@ -54,8 +56,13 @@ type Agent struct {
 func (a *Agent) Run() error {
 	// start with follower state
 	a.currentState = internal.StateFollower
+	a.id = rand.Intn(1000)
 
-	rpc.Register(a)
+	err := rpc.Register(a)
+	if err != nil {
+		return err
+	}
+
 	rpc.HandleHTTP()
 
 	// get any random free port
@@ -64,17 +71,16 @@ func (a *Agent) Run() error {
 		return err
 	}
 
-	// use JSON as a transport payload format
-	rpc.ServeCodec(jsonrpc.NewServerCodec(ln))
-
 	// start server
-	go http.Serve(ln, nil)
+	go func() {
+		a.logger.Fatal(http.Serve(ln, nil))
+	}()
 
 	a.logger.Printf("Started listening on address: %s", ln.Addr())
 
 	rand.Seed(time.Now().Unix())
 
-	after := make(chan time.Time)
+	after := make(<-chan time.Time)
 
 	for {
 		select {
@@ -87,16 +93,16 @@ func (a *Agent) Run() error {
 			err := a.StartElection()
 			if err != nil {
 				// failed election, turn to follower
-				a.State = internal.Follower
-				fallthrough
+				a.currentState = internal.StateFollower
+				// fallthrough
 			}
 
 			// no error, no problem. Won election, convert to leader state
-			a.State = internal.StateLeader
+			a.currentState = internal.StateLeader
 			a.logger.Printf("won election! converted to a leader, ID: #%s", ln.Addr())
 		default:
 			// reset timer
-			c = time.After(time.Millisecond * time.Duration(rand.Int31n(maxTimeout)))
+			after = time.After(time.Millisecond * time.Duration(rand.Int31n(maxTimeout)))
 		}
 	}
 
@@ -195,10 +201,12 @@ func (a *Agent) AppendEntries(request AppendEntriesRequest, response *AppendEntr
 	return nil
 }
 
+// TODO: implement
 func (a *Agent) StartElection() error {
 	return nil
 }
 
+// TODO: implement
 // JoinCluster joins to the existing cluster
 // receives leader address
 //  	leader address must be a address with port number, e.g: 127.0.0.1:59324
@@ -210,13 +218,14 @@ func (a *Agent) JoinCluster(addr string) error {
 
 // SendHeartbeats sends log entry request with empty entry slice to all peers
 // if any of them do not respond, start election
-func SendHeartbeats() error {
-	for peer := range a.peers {
-		timeout := time.After(rand.Int31n(300))
-		err := a.sendHeartBeat(peer)
-		if err != nil {
-			return err
-		}
+func (a *Agent) sendHeartbeats() error {
+	for _, peerAddr := range a.peers {
+		go func() {
+			err := a.sendHeartbeat(peerAddr)
+			if err != nil {
+				a.logger.Printf("peer #%s not responding", peerAddr)
+			}
+		}()
 	}
 
 	return nil
@@ -225,6 +234,20 @@ func SendHeartbeats() error {
 // sendHeartbeat creates a RPC connection between peer
 // receives peer address
 func (a *Agent) sendHeartbeat(addr string) error {
+	timeout := time.After(time.Duration(rand.Int31n(300)) * time.Millisecond)
+	ch := make(chan struct{})
+
+	go func() {
+		// send empty log entries RPC
+	}()
+
+	select {
+	case <-timeout:
+		return errors.New("timeout")
+	case <-ch:
+		return nil
+	}
+
 	return nil
 }
 
@@ -252,13 +275,13 @@ func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
 		reply.Success = true
 		reply.Value = value
 
-		return
+		return nil
 	}
 
 	switch a.currentState {
 	case internal.StateFollower:
 		// redirect request to leader
-		client, err := rpc.DialHTTP("tcp", a.LeaderAddr)
+		client, err := rpc.DialHTTP("tcp", a.leaderAddr)
 		if err != nil {
 			return err
 		}
@@ -270,8 +293,8 @@ func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
 	case internal.StateLeader:
 		// add log and send AppendEntries request
 		var index uint64
-		if len(a.log) > 0 {
-			index = a.log[len(a.log)-1].Index + 1
+		if len(a.logs) > 0 {
+			index = a.logs[len(a.logs)-1].Index + 1
 		} else {
 			index = 1
 		}
@@ -287,7 +310,7 @@ func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
 		var successCount int32
 		var wg sync.WaitGroup
 
-		wg.Add(len(peers))
+		wg.Add(len(a.peers))
 
 		for _, p := range a.peers {
 			go func(peerAddr string) {
@@ -300,7 +323,7 @@ func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
 
 				newLog := AppendEntriesRequest{
 					Term:         a.currentTerm,
-					LeaderID:     a.leaderID,
+					LeaderID:     uint64(a.id),
 					PrevLogIndex: 0,
 					PrevLogTerm:  0,
 					LeaderCommit: a.commitIndex,
@@ -328,15 +351,15 @@ func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
 		wg.Wait()
 
 		// if majority of servers accepted entry, then commit and flush into KV store
-		if len(peers)/2+1 <= successCount {
+		if len(a.peers)/2+1 <= int(successCount) {
 			switch request.Op {
 			case internal.LogOpPut:
-				err = a.kv.Put(request.Key, request.Value)
+				err := a.kv.Put(request.Key, request.Value)
 				if err != nil {
 					return err
 				}
 			case internal.LogUpDelete:
-				err = a.kv.Delete(request.Key)
+				err := a.kv.Delete(request.Key)
 				if err != nil {
 					return err
 				}
@@ -349,4 +372,6 @@ func (a *Agent) AddLog(request AddLogRequest, response *AddLogResponse) error {
 	case internal.StateCandidate:
 	default:
 	}
+
+	return nil
 }
