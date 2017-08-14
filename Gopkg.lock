@@ -1,0 +1,37 @@
+memo = "a6eefdca5df973598c9adfa5de9ba7b85b19ef4faa3ace206aebd6fc9755e70a"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/AndreasBriese/bbloom"
+  packages = ["."]
+  revision = "28f7e881ca57bc00e028f9ede9f0d9104cfeef5e"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/dgraph-io/badger"
+  packages = [".","protos","skl","table","y"]
+  revision = "766bf27ef356e635744fa45ae8c0f7044c312367"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/golang/protobuf"
+  packages = ["proto"]
+  revision = "fec3b39b059c0f88fa6b20f5ed012b1aa203a8b4"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/pkg/errors"
+  packages = ["."]
+  revision = "c605e284fe17294bda444b34710735b29d1a9d90"
+
+[[projects]]
+  branch = "master"
+  name = "golang.org/x/net"
+  packages = ["context","internal/timeseries","trace"]
+  revision = "054b33e6527139ad5b1ec2f6232c3b175bd9a30c"
+
+[[projects]]
+  branch = "master"
+  name = "golang.org/x/sys"
+  packages = ["unix"]
+  revision = "6faef541c73732f438fb660a212750a9ba9f9362"
