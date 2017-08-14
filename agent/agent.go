@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,8 +18,8 @@ import (
 )
 
 const (
-	maxTimeout = 300
-	minTimeout = 150
+	maxTimeout = 600
+	minTimeout = 350
 )
 
 var (
@@ -51,6 +52,30 @@ type Agent struct {
 	logger *log.Logger
 
 	internal.Config
+
+	server *Server
+
+	// hearbeat chan
+	// on each heartbeat, empty struct is sent
+	heartbeat      chan struct{}
+	stopHeartbeats chan struct{}
+}
+
+func New() (*Agent, error) {
+	agent := Agent{
+		peers:          []string{},
+		logs:           []internal.Log{},
+		heartbeat:      make(chan struct{}),
+		stopHeartbeats: make(chan struct{}),
+		logger:         log.New(os.Stdout, "agent", log.Lshortfile),
+	}
+
+	server := Server{
+		agent: &agent,
+	}
+
+	agent.server = &server
+	return &agent, nil
 }
 
 func (a *Agent) Run() error {
@@ -58,7 +83,7 @@ func (a *Agent) Run() error {
 	a.currentState = internal.StateFollower
 	a.id = rand.Intn(1000)
 
-	err := rpc.Register(a)
+	err := rpc.Register(a.server)
 	if err != nil {
 		return err
 	}
@@ -82,6 +107,16 @@ func (a *Agent) Run() error {
 
 	after := make(<-chan time.Time)
 
+	timeout := rand.Int31n(maxTimeout)
+
+	if timeout < minTimeout {
+		timeout += minTimeout
+	}
+
+	after = time.After(time.Millisecond * time.Duration(timeout))
+
+	a.logger.Printf("timeout %d ms before start of the election", timeout)
+
 	for {
 		select {
 		case <-after:
@@ -90,22 +125,32 @@ func (a *Agent) Run() error {
 			a.logger.Printf("timeout, starting election, ID: #%s", ln.Addr())
 			a.currentState = internal.StateCandidate
 
-			err := a.StartElection()
-			if err != nil {
-				// failed election, turn to follower
-				a.currentState = internal.StateFollower
-				// fallthrough
+			go func() {
+				err := a.StartElection()
+				if err != nil {
+					// failed election, turn to follower
+					a.currentState = internal.StateFollower
+					a.stopHeartbeats <- struct{}{}
+					return
+				}
+
+				// no error, no problem. Won election, convert to leader state
+				a.currentState = internal.StateLeader
+				a.logger.Printf("won election! converted to a leader, ID: #%s", ln.Addr())
+				a.heartbeat <- struct{}{}
+				go a.sendHeartbeats()
+			}()
+		case <-a.heartbeat:
+			// reset timer
+			timeout := rand.Int31n(maxTimeout)
+			if timeout < minTimeout {
+				timeout += minTimeout
 			}
 
-			// no error, no problem. Won election, convert to leader state
-			a.currentState = internal.StateLeader
-			a.logger.Printf("won election! converted to a leader, ID: #%s", ln.Addr())
-		default:
-			// reset timer
-			after = time.After(time.Millisecond * time.Duration(rand.Int31n(maxTimeout)))
+			a.logger.Printf("got heartbeat, timeout %d ms", timeout)
+			after = time.After(time.Millisecond * time.Duration(timeout))
 		}
 	}
-
 }
 
 // request vote
@@ -198,11 +243,65 @@ func (a *Agent) AppendEntries(request AppendEntriesRequest, response *AppendEntr
 			a.commitIndex = a.logs[len(a.logs)-1].Index
 		}
 	}
+
+	// send hearbeat msg
+	a.heartbeat <- struct{}{}
+
 	return nil
 }
 
 // TODO: implement
 func (a *Agent) StartElection() error {
+	// start from 1, for for itself
+	var votes uint32 = 1
+
+	a.currentTerm += 1
+	a.votedFor = uint64(a.id)
+
+	// send hearbeat to reset election timer
+	a.heartbeat <- struct{}{}
+
+	var wg sync.WaitGroup
+	wg.Add(len(a.peers))
+
+	for _, p := range a.peers {
+		go func(peerAddr string) {
+			defer wg.Done()
+
+			client, err := rpc.DialHTTP("tcp", peerAddr)
+			if err != nil {
+				a.logger.Println(err)
+				return
+			}
+
+			voteRequest := RequestVoteRequest{
+				Term:         a.currentTerm,
+				CandidateID:  uint64(a.id),
+				LastLogIndex: a.lastApplied,
+				LastLogTerm:  a.currentTerm - 1,
+			}
+
+			reply := RequestVoteResponse{}
+			err = client.Call("Agent.AppendEntries", voteRequest, &reply)
+			if err != nil {
+				a.logger.Println(err)
+				return
+			}
+
+			atomic.AddUint32(&votes, 1)
+		}(p)
+	}
+
+	wg.Wait()
+
+	// if majority of servers accepted entry, then commit and flush into KV store
+	if len(a.peers)/2+1 <= int(votes) {
+		a.logger.Printf("got enough votes %d from %d peers, becoming a leader", votes, len(a.peers))
+		a.currentState = internal.StateLeader
+	} else {
+		return errors.New("election failed")
+	}
+
 	return nil
 }
 
@@ -219,13 +318,34 @@ func (a *Agent) JoinCluster(addr string) error {
 // SendHeartbeats sends log entry request with empty entry slice to all peers
 // if any of them do not respond, start election
 func (a *Agent) sendHeartbeats() error {
-	for _, peerAddr := range a.peers {
-		go func() {
-			err := a.sendHeartbeat(peerAddr)
-			if err != nil {
-				a.logger.Printf("peer #%s not responding", peerAddr)
+	println("starting sending heartbeats")
+	for {
+		timeout := rand.Int31n(maxTimeout)
+		if timeout < minTimeout {
+			timeout += minTimeout
+		}
+		after := time.After(time.Millisecond * time.Duration(timeout))
+
+		select {
+		case <-after:
+			var wg sync.WaitGroup
+			wg.Add(len(a.peers))
+			for _, peerAddr := range a.peers {
+				go func() {
+					defer wg.Done()
+					err := a.sendHeartbeat(peerAddr)
+					if err != nil {
+						a.logger.Printf("peer #%s not responding", peerAddr)
+					}
+				}()
 			}
-		}()
+
+			wg.Wait()
+			a.heartbeat <- struct{}{}
+		case <-a.stopHeartbeats:
+			return nil
+		}
+
 	}
 
 	return nil
